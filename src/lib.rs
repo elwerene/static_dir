@@ -6,7 +6,7 @@ use headers::{
     IfUnmodifiedSince, LastModified, Range,
 };
 use http::{HeaderMap, StatusCode};
-use hyper::Body;
+use hyper::body::Bytes;
 use once_cell::sync::Lazy;
 use std::future::ready;
 use std::{
@@ -14,11 +14,11 @@ use std::{
     time::SystemTime,
 };
 use warp::{
+    Filter,
     filters::header::headers_cloned,
-    path::{tail, Tail},
+    path::{Tail, tail},
     reject::{self, Rejection},
     reply::Response,
-    Filter,
 };
 
 #[doc(hidden)]
@@ -116,26 +116,26 @@ enum Cond {
 
 impl Conditionals {
     fn check(self, sys_time: &SystemTime, last_mod: &LastModified) -> Cond {
-        if let Some(since) = self.if_unmodified_since {
-            if !since.precondition_passes(*sys_time) {
-                let mut res = Response::new(Body::empty());
-                *res.status_mut() = StatusCode::PRECONDITION_FAILED;
-                return Cond::NoBody(res);
-            }
+        if let Some(since) = self.if_unmodified_since
+            && !since.precondition_passes(*sys_time)
+        {
+            let mut res = Response::new(None.into());
+            *res.status_mut() = StatusCode::PRECONDITION_FAILED;
+            return Cond::NoBody(res);
         }
 
-        if let Some(since) = self.if_modified_since {
-            if !since.is_modified(*sys_time) {
-                let mut res = Response::new(Body::empty());
-                *res.status_mut() = StatusCode::NOT_MODIFIED;
-                return Cond::NoBody(res);
-            }
+        if let Some(since) = self.if_modified_since
+            && !since.is_modified(*sys_time)
+        {
+            let mut res = Response::new(None.into());
+            *res.status_mut() = StatusCode::NOT_MODIFIED;
+            return Cond::NoBody(res);
         }
 
-        if let Some(if_range) = self.if_range {
-            if if_range.is_modified(None, Some(last_mod)) {
-                return Cond::WithBody(None);
-            }
+        if let Some(if_range) = self.if_range
+            && if_range.is_modified(None, Some(last_mod))
+        {
+            return Cond::WithBody(None);
         }
 
         Cond::WithBody(self.range)
@@ -145,7 +145,7 @@ impl Conditionals {
 fn bytes_range(range: Range, max_len: u64) -> Option<(u64, u64)> {
     use std::ops::Bound;
 
-    let (start, end) = range.iter().next()?;
+    let (start, end) = range.satisfiable_ranges(max_len).next()?;
 
     let start = match start {
         Bound::Unbounded => 0,
@@ -169,7 +169,7 @@ fn bytes_range(range: Range, max_len: u64) -> Option<(u64, u64)> {
 fn reply(dir: &'static Dir<'_>, path: PathBuf, conds: Conditionals) -> Result<Response, Rejection> {
     if let Some(file) = dir.get_file(&*path) {
         log::debug!("serving: {:?}", path);
-        Ok(reply_conditional(file.contents(), &*path, conds))
+        Ok(reply_conditional(file.contents(), &path, conds))
     } else {
         log::warn!("file not found: {:?}", path);
         Err(reject::not_found())
@@ -177,7 +177,7 @@ fn reply(dir: &'static Dir<'_>, path: PathBuf, conds: Conditionals) -> Result<Re
 }
 
 fn reply_conditional(buf: &'static [u8], path: &Path, conds: Conditionals) -> Response {
-    static SYS_TIME: Lazy<SystemTime> = Lazy::new(|| SystemTime::now());
+    static SYS_TIME: Lazy<SystemTime> = Lazy::new(SystemTime::now);
     static LAST_MOD: Lazy<LastModified> = Lazy::new(|| (*SYS_TIME).into());
 
     let len = buf.len() as u64;
@@ -194,7 +194,7 @@ fn reply_conditional(buf: &'static [u8], path: &Path, conds: Conditionals) -> Re
 }
 
 fn reply_full(buf: &'static [u8], path: &Path, last_mod: LastModified) -> Response {
-    let mut resp = Response::new(buf.into());
+    let mut resp = Response::new(Bytes::from_static(buf).into());
     let hdrs = resp.headers_mut();
 
     hdrs.typed_insert(ContentLength(buf.len() as u64));
@@ -215,7 +215,7 @@ fn reply_range(
     let len = e - s;
     let buf = &buf[s as usize..e as usize];
 
-    let mut resp = Response::new(Body::from(buf));
+    let mut resp = Response::new(Bytes::from_static(buf).into());
     *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
 
     let hdrs = resp.headers_mut();
@@ -231,7 +231,7 @@ fn reply_range(
 }
 
 fn reply_unsatisfiable(len: u64) -> Response {
-    let mut resp = Response::new(Body::empty());
+    let mut resp = Response::new(None.into());
 
     *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
     resp.headers_mut()
